@@ -1,18 +1,42 @@
 #!/system/bin/sh
-# Android tc rate limit. Needs root. Default 10kbit.
-# Copy this file to the device, then:
+# Android tc: limit upload (egress) and/or download (ingress).
+# Needs root. Copy with Unix LF, then:
 #   su -c 'sh /sdcard/limit-rate-android.sh apply 10'
+#   su -c 'sh /sdcard/limit-rate-android.sh apply 10 down'
+#   su -c 'sh /sdcard/limit-rate-android.sh apply 10 up'
 #   su -c 'sh /sdcard/limit-rate-android.sh remove'
 #   su -c 'sh /sdcard/limit-rate-android.sh status'
 
 ACTION="$1"
-RATE="$2"
+ARG2="$2"
+ARG3="$3"
+RATE=10
+DIR=both
+
 if [ -z "$ACTION" ]; then
   ACTION=status
 fi
-if [ -z "$RATE" ]; then
-  RATE=10
-fi
+
+case "$ARG2" in
+  "")
+    ;;
+  up|down|both)
+    DIR="$ARG2"
+    ;;
+  *[!0-9]*)
+    echo "bad rate: $ARG2"
+    exit 1
+    ;;
+  *)
+    RATE="$ARG2"
+    ;;
+esac
+
+case "$ARG3" in
+  up|down|both)
+    DIR="$ARG3"
+    ;;
+esac
 
 tc_bin() {
   if [ -x /system/bin/tc ]; then
@@ -61,17 +85,31 @@ if [ -z "$IFACE" ]; then
   IFACE=`iface_default`
 fi
 RATE_SPEC=${RATE}kbit
+IFB=ifb0
 
 do_status() {
-  echo "uid=`id -u 2>/dev/null` tc=$TCPATH iface=$IFACE"
+  echo "uid=`id -u 2>/dev/null` tc=$TCPATH iface=$IFACE rate=$RATE_SPEC dir=$DIR"
   if [ -n "$IFACE" ]; then
     if [ -n "$TCPATH" ]; then
-      echo "---- $IFACE ----"
+      echo "---- $IFACE root (upload/egress) ----"
       run_tc qdisc show dev "$IFACE" 2>/dev/null
+      echo "---- $IFACE ingress (download) ----"
+      run_tc qdisc show dev "$IFACE" ingress 2>/dev/null
+      echo "---- $IFACE ingress filters ----"
+      run_tc filter show dev "$IFACE" parent ffff: 2>/dev/null
     fi
   fi
-  echo "up links:"
-  ip -o link show up 2>/dev/null
+  if ip link show "$IFB" >/dev/null 2>&1; then
+    echo "---- $IFB ----"
+    run_tc qdisc show dev "$IFB" 2>/dev/null
+  fi
+}
+
+clear_down() {
+  run_tc qdisc del dev "$IFACE" ingress 2>/dev/null
+  run_tc qdisc del dev "$IFB" root 2>/dev/null
+  ip link set "$IFB" down 2>/dev/null
+  ip link del "$IFB" 2>/dev/null
 }
 
 do_remove() {
@@ -85,8 +123,82 @@ do_remove() {
     exit 1
   fi
   run_tc qdisc del dev "$IFACE" root 2>/dev/null
+  clear_down
+  echo "cleared $IFACE (up+down)"
+}
+
+do_apply_up() {
+  run_tc qdisc del dev "$IFACE" root 2>/dev/null
+  run_tc qdisc add dev "$IFACE" root tbf rate "$RATE_SPEC" burst 2kb latency 400ms
+  if [ $? -ne 0 ]; then
+    echo "UPLOAD failed (tbf)"
+    return 1
+  fi
+  echo "UPLOAD ok: $IFACE egress $RATE_SPEC"
+  return 0
+}
+
+try_ifb() {
+  modprobe ifb 2>/dev/null
+  ip link add "$IFB" type ifb 2>/dev/null
+  ip link set "$IFB" up 2>/dev/null
+  if ip link show "$IFB" >/dev/null 2>&1; then
+    :
+  else
+    return 1
+  fi
   run_tc qdisc del dev "$IFACE" ingress 2>/dev/null
-  echo "cleared $IFACE"
+  run_tc qdisc add dev "$IFACE" handle ffff: ingress
+  if [ $? -ne 0 ]; then
+    return 1
+  fi
+  run_tc filter add dev "$IFACE" parent ffff: protocol all u32 match u32 0 0 action mirred egress redirect dev "$IFB"
+  if [ $? -ne 0 ]; then
+    run_tc qdisc del dev "$IFACE" ingress 2>/dev/null
+    return 1
+  fi
+  run_tc qdisc add dev "$IFB" root tbf rate "$RATE_SPEC" burst 2kb latency 400ms
+  if [ $? -ne 0 ]; then
+    clear_down
+    return 1
+  fi
+  echo "DOWNLOAD ok: ifb $IFB tbf $RATE_SPEC"
+  return 0
+}
+
+try_police() {
+  run_tc qdisc del dev "$IFACE" ingress 2>/dev/null
+  run_tc qdisc add dev "$IFACE" handle ffff: ingress
+  if [ $? -ne 0 ]; then
+    echo "DOWNLOAD failed: cannot add ingress qdisc"
+    return 1
+  fi
+  run_tc filter add dev "$IFACE" parent ffff: protocol all prio 1 u32 match u32 0 0 police rate "$RATE_SPEC" burst 12k drop
+  if [ $? -eq 0 ]; then
+    echo "DOWNLOAD ok: ingress police all $RATE_SPEC"
+    return 0
+  fi
+  run_tc filter add dev "$IFACE" parent ffff: protocol ip prio 1 u32 match u32 0 0 police rate "$RATE_SPEC" burst 12k drop
+  ip_ok=$?
+  run_tc filter add dev "$IFACE" parent ffff: protocol ipv6 prio 2 u32 match u32 0 0 police rate "$RATE_SPEC" burst 12k drop
+  ip6_ok=$?
+  if [ "$ip_ok" -eq 0 ]; then
+    echo "DOWNLOAD ok: ingress police ipv4 $RATE_SPEC (ipv6 rc=$ip6_ok)"
+    return 0
+  fi
+  echo "DOWNLOAD failed: no ifb and police/filter not supported"
+  echo "use NetValve app for download, or: su -c 'sh $0 apply $RATE up'"
+  return 1
+}
+
+do_apply_down() {
+  clear_down
+  try_ifb
+  if [ $? -eq 0 ]; then
+    return 0
+  fi
+  echo "ifb not available, try ingress police (drop extra packets)"
+  try_police
 }
 
 do_apply() {
@@ -99,19 +211,22 @@ do_apply() {
     echo "no default iface"
     exit 1
   fi
-  run_tc qdisc del dev "$IFACE" root 2>/dev/null
-  run_tc qdisc add dev "$IFACE" root tbf rate "$RATE_SPEC" burst 2kb latency 400ms
-  rc=$?
-  if [ "$rc" -ne 0 ]; then
-    echo "tbf failed, use NetValve app instead"
-    exit 1
+  if [ "$DIR" = up ]; then
+    do_apply_up
+    return
   fi
-  echo "limited egress $IFACE -> $RATE_SPEC"
+  if [ "$DIR" = down ]; then
+    do_apply_down
+    return
+  fi
+  do_apply_up
+  do_apply_down
 }
 
 case "$ACTION" in
   apply)
     do_apply
+    DIR="$DIR"
     do_status
     ;;
   remove)
@@ -122,7 +237,7 @@ case "$ACTION" in
     do_status
     ;;
   *)
-    echo "usage: $0 apply|remove|status [kbit]"
+    echo "usage: $0 apply|remove|status [kbit] [up|down|both]"
     exit 1
     ;;
 esac
